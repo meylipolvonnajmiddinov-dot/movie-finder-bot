@@ -22,21 +22,41 @@ Javobni FAQAT quyidagi JSON formatda qaytar:
 Agar kinoni aniqlab bo'lmasa, "found": false qilib qaytar.
 """
 
+# Agar bitta model band (503) bo'lsa, darhol kutmasdan keyingisiga o'tadi:
+MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+]
+
+
+def _generate_fast_fallback(contents):
+    last_error = None
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ [{model_name}] xato berdi, keyingi modelga o'tilmoqda: {str(e)[:80]}")
+            continue
+    raise last_error
+
+
 def analyze_text(user_text: str) -> dict:
     try:
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=f"Ushbu ta'rif bo'yicha kinoni top: {user_text}",
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.2,
-            ),
-        )
-        return json.loads(response.text)
+        return _generate_fast_fallback(f"Ushbu ta'rif bo'yicha kinoni top: {user_text}")
     except Exception as e:
         print(f"❌ GEMINI TEXT XATOLIK: {str(e)}")
-        return {"found": False, "description_uz": f"Xatolik tafsiloti: {str(e)[:50]}"}
+        return {"found": False, "description_uz": f"AI xatosi: {str(e)[:60]}"}
 
 
 def analyze_video(video_path: str) -> dict:
@@ -50,20 +70,11 @@ def analyze_video(video_path: str) -> dict:
         if uploaded_file.state.name == "FAILED":
             return {"found": False, "description_uz": "Videoni o'qishda xatolik yuz berdi."}
 
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[uploaded_file, "Ushbu videodagi kino yoki serialni aniqla."],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.2,
-            ),
-        )
-        return json.loads(response.text)
+        return _generate_fast_fallback([uploaded_file, "Ushbu videodagi kino yoki serialni aniqla."])
 
     except Exception as e:
         print(f"❌ GEMINI VIDEO XATOLIK: {str(e)}")
-        return {"found": False, "description_uz": f"Video xatoligi: {str(e)[:50]}"}
+        return {"found": False, "description_uz": f"Video AI xatosi: {str(e)[:60]}"}
 
     finally:
         if uploaded_file:
