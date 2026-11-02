@@ -65,7 +65,6 @@ async def cmd_stats(message: Message):
         parse_mode=ParseMode.HTML
     )
 
-# INLINE TUGMALAR BOSILGANDA ISHLAYDIGAN QISM
 @dp.callback_query(F.data == "bot_stats")
 async def cb_stats(callback: CallbackQuery):
     stats = await get_bot_stats()
@@ -108,10 +107,9 @@ async def send_movie_result(message: Message, wait_msg: Message, result: dict, q
     m_type = result.get("type", "Kino")
     desc = result.get("description_uz", "")
 
-    # Bazaga topilgan kino nomi bilan saqlaymiz
     await save_search(message.from_user.id, q_type, q_info, f"{title_uz} ({year})")
 
-    tmdb_data = await get_movie_details(title_orig, year)
+    tmdb_data = await get_movie_details(title_orig, str(year))
     rating = tmdb_data.get("rating", "—") if tmdb_data else "—"
     poster_url = tmdb_data.get("poster_url") if tmdb_data else None
 
@@ -141,8 +139,10 @@ async def handle_video(message: Message):
     video_path = os.path.join(TEMP_DIR, f"{message.video.file_unique_id}.mp4")
 
     try:
+        # Asinxron tarzda yuklab olamiz
         await bot.download(message.video, destination=video_path)
-        result = await asyncio.to_thread(analyze_video, video_path)
+        # Asinxron analyze_video funksiyasini await orqali chaqiramiz (qotib qolmaydi)
+        result = await analyze_video(video_path)
         await send_movie_result(message, wait_msg, result, "video", "Video parcha")
     except Exception as e:
         logging.error(f"Video handler xatosi: {e}")
@@ -155,7 +155,9 @@ async def handle_video(message: Message):
 async def handle_text(message: Message):
     await add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     wait_msg = await message.answer("🔍 <i>Ta'rif bo'yicha kino qidirilmoqda...</i>", parse_mode=ParseMode.HTML)
-    result = await asyncio.to_thread(analyze_text, message.text)
+    
+    # Asinxron analyze_text funksiyasini await orqali chaqiramiz
+    result = await analyze_text(message.text)
     await send_movie_result(message, wait_msg, result, "text", message.text[:100])
 
 async def main():

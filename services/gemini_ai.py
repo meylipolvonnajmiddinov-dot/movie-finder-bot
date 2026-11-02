@@ -1,9 +1,13 @@
+import asyncio
 import json
-import time
+import os
+import random
+import logging
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 from config import GEMINI_API_KEY
 
+log = logging.getLogger(__name__)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 SYSTEM_PROMPT = """
@@ -22,80 +26,119 @@ Javobni FAQAT quyidagi JSON formatda qaytar:
 Agar kinoni aniqlab bo'lmasa, "found": false qilib qaytar.
 """
 
-# Siz so'ragan barcha 4 ta model (navbatma-navbat ishlaydi):
+# Asosiy va zaxira modellar (.env da bo'lmasa, shu ro'yxat ishlaydi)
 MODELS = [
-    "gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    m.strip() for m in os.getenv(
+        "GEMINI_MODELS", 
+        "gemini-2.5-flash,gemini-2.0-flash,gemini-2.5-flash-lite"
+    ).split(",") if m.strip()
 ]
 
+RETRYABLE = {429, 500, 503, 504}
+REQUEST_TIMEOUT = 60          # soniya
+MAX_ATTEMPTS_PER_MODEL = 3
 
-def _generate_from_any_model(contents):
-    """Modellarni navbatma-navbat aylantirib, birinchi ishlaganidan javob oladi"""
-    errors = []
-    
-    # 2 marta to'liq aylana qiladi (jami 8 ta urinish)
-    for round_num in range(2):
-        for model_name in MODELS:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
-                )
-                print(f"✅ [{model_name}] muvaffaqiyatli javob berdi!")
-                return json.loads(response.text)
-            except Exception as e:
-                err_msg = str(e)
-                print(f"⚠️ [{model_name}] ishlamadi (keyingisiga o'tilmoqda): {err_msg[:90]}")
-                errors.append(f"{model_name}: {err_msg[:40]}")
+_dead_models: set[str] = set()                 # 404 bergan modellarni eslab qolish
+_semaphore = asyncio.Semaphore(3)              # bir vaqtda ko'pi bilan 3 ta so'rov
+
+
+async def _generate_from_any_model(contents) -> dict:
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        temperature=0.2,
+    )
+    last_error = None
+
+    async with _semaphore:
+        for model in MODELS:
+            if model in _dead_models:
                 continue
-        
-        # Agar 4 ta modelning hammasi band bo'lsa, 2 soniya kutib qayta aylanadi
-        time.sleep(2)
-        
-    raise Exception(" | ".join(errors[-2:]))
+
+            for attempt in range(MAX_ATTEMPTS_PER_MODEL):
+                try:
+                    resp = await asyncio.wait_for(
+                        client.aio.models.generate_content(
+                            model=model, contents=contents, config=config
+                        ),
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    data = json.loads(resp.text)
+                    # Ba'zan Gemini ro'yxat [{...}] qaytarishi mumkin, uni dict ga o'tkazamiz
+                    if isinstance(data, list) and len(data) > 0:
+                        data = data[0]
+                    print(f"✅ [{model}] muvaffaqiyatli javob berdi!")
+                    return data
+
+                except errors.APIError as e:
+                    last_error = e
+                    if e.code == 404:
+                        log.error("Model topilmadi (404), ro'yxatdan chiqarildi: %s", model)
+                        _dead_models.add(model)
+                        break  # Darhol keyingi modelga o'tish
+
+                    if e.code in RETRYABLE:
+                        delay = (2 ** attempt) + random.random()
+                        log.warning("%s -> %s, %.1fs kutib qayta urinamiz...", model, e.code, delay)
+                        await asyncio.sleep(delay)
+                        continue  # Shu modelni qayta urinish
+
+                    raise  # 400, 403 kabi xatolarda qayta urinmaymiz
+
+                except asyncio.TimeoutError as e:
+                    last_error = e
+                    log.warning("%s timeout (urinish %d)", model, attempt + 1)
+                    continue
+
+                except json.JSONDecodeError as e:
+                    last_error = e
+                    break  # JSON buzilgan bo'lsa, keyingi modelni sinab ko'ramiz
+
+    raise RuntimeError(f"Barcha modellar muvaffaqiyatsiz: {last_error!r}")
 
 
-def analyze_text(user_text: str) -> dict:
+async def analyze_text(user_text: str) -> dict:
     try:
-        return _generate_from_any_model(f"Ushbu ta'rif bo'yicha kinoni top: {user_text}")
+        return await _generate_from_any_model(
+            f"Ushbu ta'rif bo'yicha kinoni top: {user_text}"
+        )
     except Exception as e:
-        print(f"❌ BARCHA MODELLAR XATO BERDI (TEXT): {str(e)}")
+        log.exception("analyze_text xatosi: %s", e)
         return {
-            "found": False, 
-            "description_uz": "Hozirda barcha AI serverlari band. Iltimos, 10 soniyadan so'ng qayta yuboring."
+            "found": False,
+            "description_uz": "Hozirda AI serverlari band. Birozdan so'ng qayta yuboring.",
         }
 
 
-def analyze_video(video_path: str) -> dict:
-    uploaded_file = None
+async def analyze_video(video_path: str) -> dict:
+    uploaded = None
     try:
-        uploaded_file = client.files.upload(file=video_path)
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(2)
-            uploaded_file = client.files.get(name=uploaded_file.name)
+        uploaded = await client.aio.files.upload(file=video_path)
 
-        if uploaded_file.state.name == "FAILED":
+        # Videoning Google serverida qayta ishlanishini asinxron kutish (maksimum ~2 daqiqa)
+        for _ in range(60):
+            if uploaded.state.name != "PROCESSING":
+                break
+            await asyncio.sleep(2)
+            uploaded = await client.aio.files.get(name=uploaded.name)
+        else:
+            return {"found": False, "description_uz": "Video juda uzoq qayta ishlandi."}
+
+        if uploaded.state.name == "FAILED":
             return {"found": False, "description_uz": "Videoni o'qishda xatolik yuz berdi."}
 
-        return _generate_from_any_model([uploaded_file, "Ushbu videodagi kino yoki serialni aniqla."])
-
+        return await _generate_from_any_model(
+            [uploaded, "Ushbu videodagi kino yoki serialni aniqla."]
+        )
     except Exception as e:
-        print(f"❌ BARCHA MODELLAR XATO BERDI (VIDEO): {str(e)}")
+        log.exception("analyze_video xatosi: %s", e)
         return {
-            "found": False, 
-            "description_uz": "Videoni tahlil qilishda serverlar band bo'ldi. Birozdan so'ng qayta yuboring."
+            "found": False,
+            "description_uz": "Videoni tahlil qilishda xatolik. Birozdan so'ng qayta yuboring.",
         }
-
     finally:
-        if uploaded_file:
+        if uploaded:
             try:
-                client.files.delete(name=uploaded_file.name)
+                await client.aio.files.delete(name=uploaded.name)
             except Exception:
                 pass
